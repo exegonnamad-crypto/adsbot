@@ -478,6 +478,71 @@ asyncio.run(main())
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post("/api/accounts/check/:id", auth, async (req, res) => {
+  try {
+    const account = await TgAccount.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!account?.sessionString) return res.status(400).json({ error: "Account not found" });
+    const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            await client.disconnect()
+            username = getattr(me, "username", "") or "" if me else ""
+            firstName = getattr(me, "first_name", "") or "" if me else ""
+            print(json.dumps({"success": True, "alive": True, "username": username, "firstName": firstName}))
+        else:
+            await client.disconnect()
+            print(json.dumps({"success": True, "alive": False, "error": "Session expired"}))
+    except Exception as e:
+        print(json.dumps({"success": False, "alive": False, "error": str(e)}))
+asyncio.run(main())
+`;
+    const result = await runPython(script, 20000);
+    if (!result.alive) {
+      await TgAccount.findByIdAndUpdate(account._id, { status: "needs_auth" });
+    } else {
+      await TgAccount.findByIdAndUpdate(account._id, { status: "active" });
+    }
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/accounts/check-all", auth, async (req, res) => {
+  try {
+    const accounts = await TgAccount.find({ userId: req.user.id });
+    const results = [];
+    for (const account of accounts) {
+      if (!account.sessionString) { results.push({ id: account._id, phone: account.phone, alive: false, error: "No session" }); continue; }
+      const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        alive = await client.is_user_authorized()
+        await client.disconnect()
+        print(json.dumps({"success": True, "alive": alive}))
+    except Exception as e:
+        print(json.dumps({"success": False, "alive": False, "error": str(e)}))
+asyncio.run(main())
+`;
+      const result = await runPython(script, 20000);
+      const status = result.alive ? "active" : "needs_auth";
+      await TgAccount.findByIdAndUpdate(account._id, { status });
+      results.push({ id: account._id, phone: account.phone, label: account.label, alive: result.alive, status });
+    }
+    res.json({ results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/api/accounts", auth, async (req, res) => {
   try {
     const accs = await TgAccount.find({ userId: req.user.id }).sort({ createdAt: -1 });
@@ -603,6 +668,14 @@ app.post("/api/blacklist", auth, async (req, res) => {
     const bl = await Blacklist.create({ userId: req.user.id, username: clean, reason: reason || "" });
     await TgGroup.updateOne({ userId: req.user.id, username: clean }, { isBlacklisted: true, blacklistReason: reason || "" });
     res.json(bl);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/blacklist/:id", auth, async (req, res) => {
+  try {
+    const bl = await Blacklist.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    if (bl) await TgGroup.updateOne({ userId: req.user.id, username: bl.username }, { isBlacklisted: false, blacklistReason: "" });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -783,7 +856,37 @@ async function runCampaignBatch(campaign) {
   }
 }
 
-// ── SCHEDULER ─────────────────────────────────────────────────────────────────
+// ── HOURLY ACCOUNT HEALTH CHECK ───────────────────────────────────────────────
+cron.schedule("0 * * * *", async () => {
+  try {
+    const accounts = await TgAccount.find({ status: { $in: ["active", "needs_auth"] } });
+    for (const account of accounts) {
+      if (!account.sessionString) continue;
+      const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        alive = await client.is_user_authorized()
+        await client.disconnect()
+        print(json.dumps({"alive": alive}))
+    except:
+        print(json.dumps({"alive": False}))
+asyncio.run(main())
+`;
+      const result = await runPython(script, 15000);
+      if (!result.alive && account.status === "active") {
+        await TgAccount.findByIdAndUpdate(account._id, { status: "needs_auth" });
+        console.log(`⚠️ Account ${account.phone} needs re-auth`);
+      } else if (result.alive && account.status === "needs_auth") {
+        await TgAccount.findByIdAndUpdate(account._id, { status: "active" });
+      }
+    }
+  } catch (e) { console.error("Health check error:", e.message); }
+});
 cron.schedule("* * * * *", async () => {
   try {
     const now = new Date();
