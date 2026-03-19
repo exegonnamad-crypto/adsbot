@@ -628,6 +628,52 @@ bot.on("callback_query", async (query) => {
   else if (data === "admin_users") await showAdminUsers(chatId, msgId, session);
   else if (data === "admin_payments") await showAdminPayments(chatId, msgId, session);
   else if (data === "admin_grant") { session.step = "admin_grant_email"; session.data = {}; await editMsg(chatId, msgId, "🎁 *Grant Plan/Credits*\n\nEnter user email:", { reply_markup: backKb(lang, "admin") }); }
+
+  // ── CAMPAIGN ACCOUNT SELECTION
+  else if (data.startsWith("camp_acc_")) {
+    const id = data.replace("camp_acc_", "");
+    if (id === "all") {
+      session.data.campAccounts = session.data.allAccounts?.map(a => a._id) || [];
+    } else {
+      if (!session.data.campAccounts) session.data.campAccounts = [];
+      if (!session.data.campAccounts.includes(id)) session.data.campAccounts.push(id);
+    }
+    const r = await api("GET", "/api/groups", null, session.token);
+    if (!r.ok || !r.data.length) { await sendMsg(chatId, "❌ No groups found. Add groups first!"); session.step = "idle"; return; }
+    await sendMsg(chatId, `✅ ${session.data.campAccounts.length} account(s) selected!\n\n👥 How many groups to target?`, { reply_markup: { inline_keyboard: [
+      [{ text: "50 groups", callback_data: "camp_grp_50" }, { text: "100 groups", callback_data: "camp_grp_100" }],
+      [{ text: "500 groups", callback_data: "camp_grp_500" }, { text: "✅ All groups", callback_data: "camp_grp_all" }],
+    ]}});
+  }
+
+  // ── CAMPAIGN GROUP SELECTION
+  else if (data.startsWith("camp_grp_")) {
+    const count = data.replace("camp_grp_", "");
+    const r = await api("GET", "/api/groups", null, session.token);
+    if (r.ok) {
+      const groups = count === "all" ? r.data : r.data.slice(0, parseInt(count));
+      session.data.campGroups = groups.map(g => g._id);
+    }
+    session.step = "idle";
+    await sendMsg(chatId, "⏳ Creating campaign...");
+    const campR = await api("POST", "/api/campaigns", {
+      name: session.data.campName,
+      message: session.data.campMessage,
+      variants: session.data.campVariants || [],
+      groupIds: session.data.campGroups,
+      accountIds: session.data.campAccounts,
+      postsPerDay: 10, delayMin: 12, delayMax: 45,
+      intervalMinutes: 15, batchSize: 5,
+      useSpintax: session.data.campMessage?.includes("{"),
+      useSmartRotation: true, skipBlacklisted: true,
+    }, session.token);
+    if (campR.ok) {
+      await sendMsg(chatId, `✅ *Campaign Created!*\n\nName: *${campR.data.name}*\nGroups: ${session.data.campGroups?.length}\nAccounts: ${session.data.campAccounts?.length}\n\nGo to Campaigns to start it! 🚀`);
+    } else {
+      await sendMsg(chatId, `❌ Failed: ${campR.error}`);
+    }
+    await showCampaigns(chatId, null, session);
+  }
 });
 
 // ── TEXT HANDLER ──────────────────────────────────────────────────────────────
@@ -1015,70 +1061,8 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ── CAMPAIGN ACCOUNT SELECTION ────────────────────────────────────────────────
-bot.on("callback_query", async (query) => {
-  if (processedCbs.has(query.id)) return;
-  processedCbs.add(query.id);
-  setTimeout(() => processedCbs.delete(query.id), 10000);
+// ── CAMPAIGN ACCOUNT/GROUP SELECTION (merged into main handler above) ─────────
 
-  const chatId = query.message.chat.id;
-  const data = query.data;
-  const session = await getSession(chatId);
-  const lang = session.lang || "en";
-
-  await bot.answerCallbackQuery(query.id).catch(() => {});
-
-  if (!session.token) return;
-
-  if (data.startsWith("camp_acc_")) {
-    const id = data.replace("camp_acc_", "");
-    if (id === "all") {
-      session.data.campAccounts = session.data.allAccounts?.map(a => a._id) || [];
-    } else {
-      if (!session.data.campAccounts) session.data.campAccounts = [];
-      if (!session.data.campAccounts.includes(id)) session.data.campAccounts.push(id);
-    }
-    session.step = "camp_groups";
-    const r = await api("GET", "/api/groups", null, session.token);
-    if (!r.ok || !r.data.length) { await sendMsg(chatId, "❌ No groups found. Add groups first!"); session.step = "idle"; return; }
-    await sendMsg(chatId, `✅ ${session.data.campAccounts.length} account(s) selected!\n\n👥 How many groups to target?`, { reply_markup: { inline_keyboard: [
-      [{ text: "50 groups", callback_data: "camp_grp_50" }, { text: "100 groups", callback_data: "camp_grp_100" }],
-      [{ text: "500 groups", callback_data: "camp_grp_500" }, { text: "All groups", callback_data: "camp_grp_all" }],
-    ]}});
-  }
-
-  else if (data.startsWith("camp_grp_")) {
-    const count = data.replace("camp_grp_", "");
-    const r = await api("GET", "/api/groups", null, session.token);
-    if (r.ok) {
-      const groups = count === "all" ? r.data : r.data.slice(0, parseInt(count));
-      session.data.campGroups = groups.map(g => g._id);
-    }
-    session.step = "idle";
-    await sendMsg(chatId, "⏳ Creating campaign...");
-    const campR = await api("POST", "/api/campaigns", {
-      name: session.data.campName,
-      message: session.data.campMessage,
-      variants: session.data.campVariants || [],
-      groupIds: session.data.campGroups,
-      accountIds: session.data.campAccounts,
-      postsPerDay: 10,
-      delayMin: 12,
-      delayMax: 45,
-      intervalMinutes: 15,
-      batchSize: 5,
-      useSpintax: session.data.campMessage?.includes("{"),
-      useSmartRotation: true,
-      skipBlacklisted: true,
-    }, session.token);
-    if (campR.ok) {
-      await sendMsg(chatId, `✅ *Campaign Created!*\n\nName: ${campR.data.name}\nGroups: ${session.data.campGroups?.length}\nAccounts: ${session.data.campAccounts?.length}\n\nStart it from the Campaigns menu!`);
-    } else {
-      await sendMsg(chatId, `❌ Failed: ${campR.error}`);
-    }
-    await showCampaigns(chatId, null, session);
-  }
-});
 
 // ── MENU DISPLAY FUNCTIONS ────────────────────────────────────────────────────
 async function showMainMenu(chatId, session, msgId = null) {
