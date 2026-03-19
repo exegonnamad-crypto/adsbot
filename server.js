@@ -20,7 +20,7 @@ app.use((req, res, next) => {
   if (req.path === "/api/payments/webhook") {
     express.raw({ type: "*/*" })(req, res, next);
   } else {
-    express.json({ limit: "10mb" })(req, res, next);
+    express.json({ limit: "10mb" })(req, res, (err) => { if (err) { req.body = {}; } next(); });
   }
 });
 
