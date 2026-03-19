@@ -776,8 +776,7 @@ async def main():
     try:
         client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
         await client.connect()
-        await client.get_dialogs(limit=3)
-        await asyncio.sleep(random.uniform(1, 4))
+        await asyncio.sleep(random.uniform(1, 3))
         entity = await client.get_entity("${group.username}")
         ${sendCode}
         new_session = client.session.save()
