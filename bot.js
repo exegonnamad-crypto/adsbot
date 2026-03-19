@@ -393,8 +393,15 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   await showLangSelect(chatId);
 });
 
-// ── CALLBACK HANDLER ──────────────────────────────────────────────────────────
+// ── CALLBACK DEDUP ────────────────────────────────────────────────────────────
+const processedCallbacks = new Set();
+
+// ── CALLBACK HANDLER ────────────────────────────────────────────────────────────
 bot.on("callback_query", async (query) => {
+  if (processedCallbacks.has(query.id)) return;
+  processedCallbacks.add(query.id);
+  setTimeout(() => processedCallbacks.delete(query.id), 10000);
+
   const chatId = query.message.chat.id;
   const msgId = query.message.message_id;
   const data = query.data;
