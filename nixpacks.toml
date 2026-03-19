@@ -2,7 +2,7 @@
 nixPkgs = ["nodejs_20", "python3", "python312Packages.pip"]
 
 [phases.install]
-cmds = ["npm install", "pip3 install telethon --break-system-packages"]
+cmds = ["npm install", "pip3 install telethon socks --break-system-packages"]
 
 [start]
 cmd = "node index.js"
