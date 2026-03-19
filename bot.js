@@ -223,6 +223,7 @@ async function api(method, endpoint, body = null, token = null) {
     const res = await axios({ method, url: `${BACKEND_URL}${endpoint}`, data: body, headers, timeout: 15000 });
     return { ok: true, data: res.data };
   } catch (e) {
+    console.error("API ERROR:", method, endpoint, e.response?.status, e.response?.data || e.message);
     return { ok: false, error: e.response?.data?.error || e.message };
   }
 }
