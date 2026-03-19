@@ -1,9 +1,9 @@
 {
   "name": "campaignx",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js & node bot.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.0",
