@@ -279,6 +279,28 @@ bot.on("callback_query", async (query) => {
     session.step = "acc_phone"; session.data = {};
     await editMsg(chatId, msgId, "📱 *Add Telegram Account*\n\nEnter phone number with country code:\nExample: `+1234567890`", { reply_markup: backKb(lang, "accounts") });
   }
+  else if (data === "accounts_checkall") {
+    await bot.answerCallbackQuery(query.id, { text: "🔍 Checking all accounts...", show_alert: false });
+    await sendMsg(chatId, "⏳ Checking all accounts health...");
+    const r = await api("POST", "/api/accounts/check-all", {}, session.token);
+    if (!r.ok) { await sendMsg(chatId, `❌ ${r.error}`); return; }
+    const results = r.data.results;
+    const text = `🔍 *Account Health Check*\n\n${results.map(a => `${a.alive ? "🟢" : "🔴"} *${a.label||a.phone}* — ${a.alive ? "Live ✅" : "Dead ❌ (needs re-auth)"}`).join("\n")}`;
+    await sendMsg(chatId, text);
+    await showAccounts(chatId, null, session);
+  }
+  else if (data.startsWith("acc_check_")) {
+    const id = data.replace("acc_check_", "");
+    await bot.answerCallbackQuery(query.id, { text: "🔍 Checking...", show_alert: false });
+    const r = await api("POST", `/api/accounts/check/${id}`, {}, session.token);
+    const accR = await api("GET", "/api/accounts", null, session.token);
+    const acc = accR.ok ? accR.data.find(a => a._id === id) : null;
+    await bot.answerCallbackQuery(query.id, {
+      text: r.ok && r.data.alive ? `✅ ${acc?.label||acc?.phone} is LIVE!` : `❌ ${acc?.label||acc?.phone} is DEAD — needs re-auth!`,
+      show_alert: true
+    });
+    await showAccounts(chatId, msgId, session);
+  }
   else if (data.startsWith("acc_delete_")) {
     const id = data.replace("acc_delete_", "");
     const r = await api("DELETE", `/api/accounts/${id}`, null, session.token);
@@ -307,6 +329,13 @@ bot.on("callback_query", async (query) => {
     const r = await api("DELETE", "/api/groups", null, session.token);
     await bot.answerCallbackQuery(query.id, { text: r.ok ? `✅ Deleted ${r.data.deleted} groups!` : `❌ ${r.error}`, show_alert: true });
     await showGroups(chatId, msgId, session);
+  }
+  else if (data === "groups_blacklist") await showBlacklist(chatId, msgId, session);
+  else if (data.startsWith("bl_remove_")) {
+    const id = data.replace("bl_remove_", "");
+    const r = await api("DELETE", `/api/blacklist/${id}`, null, session.token);
+    await bot.answerCallbackQuery(query.id, { text: r.ok ? "✅ Removed from blacklist!" : `❌ ${r.error}`, show_alert: true });
+    await showBlacklist(chatId, msgId, session);
   }
 
   // ── CAMPAIGNS
@@ -1083,8 +1112,12 @@ async function showAccounts(chatId, msgId, session) {
   const details = accs.length ? accs.slice(0, 8).map(a => `${statusEmoji[a.status]||"⚪"} *${a.label||a.phone}* — ${a.status} | Sent: ${a.groupsSent}`).join("\n") : "No accounts yet.";
   const text = `👤 *Accounts* (${accs.length})\n\n${details}`;
   const kb = { inline_keyboard: [
-    [{ text: "➕ Add Account (OTP)", callback_data: "accounts_add" }],
-    ...accs.slice(0, 5).map(a => [{ text: `${statusEmoji[a.status]||"⚪"} ${a.label||a.phone}`, callback_data: `acc_status_${a._id}` }, { text: "🗑️", callback_data: `acc_delete_${a._id}` }]),
+    [{ text: "➕ Add Account (OTP)", callback_data: "accounts_add" }, { text: "🔍 Check All", callback_data: "accounts_checkall" }],
+    ...accs.slice(0, 5).map(a => [
+      { text: `${statusEmoji[a.status]||"⚪"} ${a.label||a.phone}`, callback_data: `acc_status_${a._id}` },
+      { text: "🔍", callback_data: `acc_check_${a._id}` },
+      { text: "🗑️", callback_data: `acc_delete_${a._id}` }
+    ]),
     [{ text: t(lang, "back"), callback_data: "back_main" }],
   ]};
   if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
@@ -1100,7 +1133,7 @@ async function showGroups(chatId, msgId, session) {
   const text = `👥 *Groups* (${groups.length})\n\n${details}`;
   const kb = { inline_keyboard: [
     [{ text: "➕ Add Group", callback_data: "groups_add" }, { text: "📋 Bulk Add", callback_data: "groups_bulk" }],
-    [{ text: "🗑️ Clear All", callback_data: "groups_clear" }],
+    [{ text: "🗑️ Clear All Groups", callback_data: "groups_clear" }, { text: "🚫 View Blacklist", callback_data: "groups_blacklist" }],
     [{ text: t(lang, "back"), callback_data: "back_main" }],
   ]};
   if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
@@ -1414,6 +1447,19 @@ async function showAITools(chatId, msgId, session) {
   ]};
   if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
   else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
+async function showBlacklist(chatId, msgId, session) {
+  const lang = session.lang || "en";
+  const r = await api("GET", "/api/blacklist", null, session.token);
+  if (!r.ok) { await sendMsg(chatId, `❌ ${r.error}`); return; }
+  const list = r.data;
+  const details = list.length ? list.slice(0, 8).map(b => `• @${b.username} — ${b.autoAdded ? "auto" : "manual"}`).join("\n") : "Blacklist is empty.";
+  const text = `🚫 *Blacklist* (${list.length})\n\n${details}`;
+  const rows = list.slice(0, 8).map(b => [{ text: `✅ Remove @${b.username}`, callback_data: `bl_remove_${b._id}` }]);
+  rows.push([{ text: "◀️ Back", callback_data: "menu_groups" }]);
+  if (msgId) await editMsg(chatId, msgId, text, { reply_markup: { inline_keyboard: rows } });
+  else await sendMsg(chatId, text, { reply_markup: { inline_keyboard: rows } });
 }
 
 async function showGroupFinder(chatId, msgId, session) {
