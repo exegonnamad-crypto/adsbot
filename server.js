@@ -454,7 +454,9 @@ async def main():
         new_session = client.session.save()
         me = await client.get_me()
         await client.disconnect()
-        print(json.dumps({"success": True, "session": new_session, "username": me.username or "", "firstName": me.first_name or ""}))
+        username = getattr(me, "username", "") or "" if me else ""
+        firstName = getattr(me, "first_name", "") or "" if me else ""
+        print(json.dumps({"success": True, "session": new_session, "username": username, "firstName": firstName}))
     except Exception as e:
         print(json.dumps({"success": False, "error": str(e)}))
 asyncio.run(main())
