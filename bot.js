@@ -13,11 +13,57 @@ const ADMIN_TG_ID = process.env.ADMIN_TG_ID || "";
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ── SESSION ───────────────────────────────────────────────────────────────────
-const sessions = {};
-function getSession(id) {
-  if (!sessions[id]) sessions[id] = { step: "idle", data: {}, lang: "en" };
-  return sessions[id];
+// ── SESSION (MongoDB persistent) ──────────────────────────────────────────────
+const sessions = {}; // in-memory cache
+
+async function loadSession(telegramId) {
+  if (sessions[telegramId]) return sessions[telegramId];
+  try {
+    const r = await axios.get(`${BACKEND_URL}/api/bot-session/${telegramId}`, { timeout: 5000 });
+    if (r.data && r.data.telegramId) {
+      sessions[telegramId] = {
+        token: r.data.token || null,
+        user: r.data.token ? {
+          name: r.data.userName, plan: r.data.userPlan,
+          credits: r.data.userCredits, isAdmin: r.data.userIsAdmin,
+          email: r.data.userEmail, referralCode: r.data.userReferralCode,
+        } : null,
+        lang: r.data.lang || "en",
+        step: "idle",
+        data: {
+          forwardTarget: r.data.forwardTarget,
+          sentimentAlerts: r.data.sentimentAlerts,
+          timezone: r.data.timezone || "UTC",
+        },
+      };
+      return sessions[telegramId];
+    }
+  } catch {}
+  sessions[telegramId] = { step: "idle", data: {}, lang: "en", token: null, user: null };
+  return sessions[telegramId];
+}
+
+async function saveSession(telegramId, session) {
+  sessions[telegramId] = session;
+  try {
+    await axios.post(`${BACKEND_URL}/api/bot-session/${telegramId}`, {
+      token: session.token || "",
+      userName: session.user?.name || "",
+      userPlan: session.user?.plan || "trial",
+      userCredits: session.user?.credits || 0,
+      userIsAdmin: session.user?.isAdmin || false,
+      userEmail: session.user?.email || "",
+      userReferralCode: session.user?.referralCode || "",
+      lang: session.lang || "en",
+      forwardTarget: session.data?.forwardTarget || "",
+      sentimentAlerts: session.data?.sentimentAlerts || false,
+      timezone: session.data?.timezone || "UTC",
+    }, { timeout: 5000 });
+  } catch (e) { console.error("Session save error:", e.message); }
+}
+
+async function getSession(telegramId) {
+  return await loadSession(String(telegramId));
 }
 
 // ── TRANSLATIONS ──────────────────────────────────────────────────────────────
@@ -113,6 +159,8 @@ function mainKb(lang, isAdmin = false) {
     [{ text: "📢 Campaigns", callback_data: "menu_campaigns" }, { text: "👤 Accounts", callback_data: "menu_accounts" }],
     [{ text: "👥 Groups", callback_data: "menu_groups" }, { text: "📊 Statistics", callback_data: "menu_stats" }],
     [{ text: "📝 Templates", callback_data: "menu_templates" }, { text: "📬 Inbox", callback_data: "menu_inbox" }],
+    [{ text: "🤖 AI Tools", callback_data: "menu_ai" }, { text: "🔍 Group Finder", callback_data: "menu_groupfinder" }],
+    [{ text: "🌍 Timezone Scheduler", callback_data: "menu_timezone" }, { text: "🖼️ Media Campaign", callback_data: "menu_media" }],
     [{ text: "💳 Billing", callback_data: "menu_billing" }, { text: "⚙️ Settings", callback_data: "menu_settings" }],
     [{ text: "📤 Forward Setup", callback_data: "menu_forward" }, { text: "📩 Contact Admin", callback_data: "menu_contact" }],
     [{ text: "❓ Help", callback_data: "menu_help" }, { text: "🚪 Logout", callback_data: "auth_logout" }],
@@ -136,14 +184,15 @@ const usdToStars = (usd) => Math.ceil(usd / 0.013);
 // ── /start ────────────────────────────────────────────────────────────────────
 bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const session = getSession(chatId);
+  const session = await getSession(chatId);
   session.step = "idle";
   const ref = (match[1] || "").trim();
   if (ref) session.data.referralCode = ref;
   if (session.token) {
     const r = await api("GET", "/api/me", null, session.token);
-    if (r.ok) { session.user = r.data; await showMainMenu(chatId, session); return; }
+    if (r.ok) { session.user = r.data; await saveSession(chatId, session); await showMainMenu(chatId, session); return; }
     session.token = null; session.user = null;
+    await saveSession(chatId, session);
   }
   await sendMsg(chatId, "🌐 *Choose your language / اختر لغتك / Выберите язык / भाषा चुनें:*", { reply_markup: langKb() });
 });
@@ -160,7 +209,7 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const msgId = query.message.message_id;
   const data = query.data;
-  const session = getSession(chatId);
+  const session = await getSession(chatId);
   const lang = session.lang || "en";
 
   await bot.answerCallbackQuery(query.id).catch(() => {});
@@ -168,6 +217,7 @@ bot.on("callback_query", async (query) => {
   // ── LANGUAGE
   if (data.startsWith("lang_")) {
     session.lang = data.replace("lang_", "");
+    await saveSession(chatId, session);
     await editMsg(chatId, msgId, `${t(session.lang, "welcome_title")}\n\n${t(session.lang, "welcome_desc")}`, { reply_markup: authKb(session.lang) });
     return;
   }
@@ -198,6 +248,7 @@ bot.on("callback_query", async (query) => {
   if (data === "auth_register") { session.step = "reg_name"; session.data = {}; await editMsg(chatId, msgId, `📝 *Register*\n\n${t(lang, "enter_name")}`); return; }
   if (data === "auth_logout") {
     session.token = null; session.user = null; session.step = "idle";
+    await saveSession(chatId, session);
     await editMsg(chatId, msgId, "✅ Logged out!");
     setTimeout(() => sendMsg(chatId, "🌐 Choose language:", { reply_markup: langKb() }), 1000);
     return;
@@ -218,7 +269,10 @@ bot.on("callback_query", async (query) => {
   else if (data === "menu_forward") await showForward(chatId, msgId, session);
   else if (data === "menu_contact") { session.step = "contact_admin"; await editMsg(chatId, msgId, "📩 *Contact Admin*\n\nSend your message:", { reply_markup: backKb(lang) }); }
   else if (data === "menu_help") await showHelp(chatId, msgId, session);
-  else if (data === "menu_admin") await showAdmin(chatId, msgId, session);
+  else if (data === "menu_ai") await showAITools(chatId, msgId, session);
+  else if (data === "menu_groupfinder") await showGroupFinder(chatId, msgId, session);
+  else if (data === "menu_timezone") await showTimezoneScheduler(chatId, msgId, session);
+  else if (data === "menu_media") await showMediaCampaign(chatId, msgId, session);
 
   // ── ACCOUNTS
   else if (data === "accounts_add") {
@@ -323,15 +377,155 @@ bot.on("callback_query", async (query) => {
     }
   }
 
-  // ── AI REWRITE
+  // ── AI TOOLS
+  else if (data === "ai_campaign_creator") {
+    session.step = "ai_camp_product";
+    session.data = {};
+    await editMsg(chatId, msgId, `🤖 *AI Campaign Creator*\n\nDescribe your product or service in a few words:\n\nExample: _"crypto trading signals", "fitness coaching", "web design services"_`, { reply_markup: backKb(lang, "ai") });
+  }
   else if (data === "ai_rewrite") {
     session.step = "ai_rewrite";
-    await editMsg(chatId, msgId, "🤖 *AI Message Rewriter*\n\nSend your message and I'll generate 5 AI variants with different tones:", { reply_markup: backKb(lang) });
+    await editMsg(chatId, msgId, "✨ *AI Message Rewriter*\n\nSend your message and I'll generate 5 powerful variants:", { reply_markup: backKb(lang, "ai") });
+  }
+  else if (data === "ai_reply_templates") {
+    session.step = "ai_reply_tpl";
+    await editMsg(chatId, msgId, "💬 *AI Reply Templates*\n\nDescribe the type of replies you get (e.g. 'interested buyers', 'people asking price', 'people asking how it works'):", { reply_markup: backKb(lang, "ai") });
   }
   else if (data.startsWith("ai_tone_")) {
-    const tone = data.replace("ai_tone_", "");
-    session.data.aiTone = tone;
+    session.data.aiTone = data.replace("ai_tone_", "");
+    await bot.answerCallbackQuery(query.id, { text: `✅ Tone: ${session.data.aiTone}`, show_alert: false });
+  }
+  else if (data.startsWith("ai_camp_tone_")) {
+    const tone = data.replace("ai_camp_tone_", "");
+    session.data.aiCampTone = tone;
     await bot.answerCallbackQuery(query.id, { text: `✅ Tone set to ${tone}`, show_alert: false });
+    // Now generate with selected tone
+    await generateAICampaign(chatId, session);
+  }
+  else if (data === "ai_camp_save") {
+    // Save generated message as template
+    if (session.data.aiGeneratedMsg) {
+      const r = await api("POST", "/api/templates", {
+        name: `AI: ${session.data.aiProduct?.slice(0,30)}`,
+        message: session.data.aiGeneratedMsg,
+        variants: session.data.aiGeneratedVariants || [],
+        niche: session.data.aiNiche || "General"
+      }, session.token);
+      await bot.answerCallbackQuery(query.id, { text: r.ok ? "✅ Saved as template!" : `❌ ${r.error}`, show_alert: true });
+    }
+  }
+  else if (data === "ai_camp_use") {
+    // Use generated message to create campaign
+    session.data.campMessage = session.data.aiGeneratedMsg;
+    session.data.campVariants = session.data.aiGeneratedVariants || [];
+    session.step = "camp_name";
+    await editMsg(chatId, msgId, "✅ Message ready!\n\nNow enter your campaign name:", { reply_markup: backKb(lang, "campaigns") });
+  }
+  else if (data === "ai_camp_regenerate") {
+    await generateAICampaign(chatId, session);
+  }
+
+  // ── GROUP FINDER
+  else if (data === "groupfinder_search") {
+    session.step = "groupfinder_keyword";
+    await editMsg(chatId, msgId, "🔍 *AI Group Finder*\n\nEnter keyword or niche to search:\n\nExample: `crypto`, `fitness`, `business`", { reply_markup: backKb(lang, "groupfinder") });
+  }
+  else if (data.startsWith("gf_add_")) {
+    const username = data.replace("gf_add_", "");
+    const r = await api("POST", "/api/groups", { username, title: username, niche: session.data.gfNiche || "General" }, session.token);
+    await bot.answerCallbackQuery(query.id, { text: r.ok ? `✅ Added @${username}!` : `❌ ${r.error}`, show_alert: true });
+  }
+  else if (data === "gf_add_all") {
+    const groups = session.data.gfResults || [];
+    if (!groups.length) return;
+    const r = await api("POST", "/api/groups/bulk", { groups: groups.map(g => ({ username: g.username, title: g.title, members: g.members, niche: session.data.gfNiche || "General" })) }, session.token);
+    await bot.answerCallbackQuery(query.id, { text: r.ok ? `✅ Added ${r.data.added} groups!` : `❌ ${r.error}`, show_alert: true });
+  }
+
+  // ── TIMEZONE SCHEDULER
+  else if (data === "tz_pick") {
+    await editMsg(chatId, msgId, "🌍 Select your timezone:", { reply_markup: { inline_keyboard: [
+      [{ text: "🇺🇸 EST (New York)", callback_data: "tz_set_EST" }, { text: "🇺🇸 PST (LA)", callback_data: "tz_set_PST" }],
+      [{ text: "🇬🇧 GMT (London)", callback_data: "tz_set_GMT" }, { text: "🇩🇪 CET (Berlin)", callback_data: "tz_set_CET" }],
+      [{ text: "🇷🇺 MSK (Moscow)", callback_data: "tz_set_MSK" }, { text: "🇦🇪 GST (Dubai)", callback_data: "tz_set_GST" }],
+      [{ text: "🇮🇳 IST (India)", callback_data: "tz_set_IST" }, { text: "🇨🇳 SGT (Singapore)", callback_data: "tz_set_SGT" }],
+      [{ text: "🇯🇵 JST (Tokyo)", callback_data: "tz_set_JST" }, { text: "🇦🇺 AEST (Sydney)", callback_data: "tz_set_AEST" }],
+      [{ text: "🌐 UTC", callback_data: "tz_set_UTC" }],
+      [{ text: "◀️ Back", callback_data: "menu_timezone" }],
+    ]}});
+  }
+  else if (data.startsWith("tz_set_")) {
+    const tz = data.replace("tz_set_", "");
+    session.data.timezone = tz;
+    await bot.answerCallbackQuery(query.id, { text: `✅ Timezone: ${tz}`, show_alert: false });
+    await showTimezoneScheduler(chatId, msgId, session);
+  }
+  else if (data === "tz_peak_detect") {
+    session.step = "tz_peak_camp";
+    await editMsg(chatId, msgId, "📊 *Peak Hour Detection*\n\nEnter campaign name to enable peak-hour posting:", { reply_markup: backKb(lang, "timezone") });
+  }
+  else if (data === "tz_schedule_camp") {
+    session.step = "tz_camp_select";
+    const r = await api("GET", "/api/campaigns", null, session.token);
+    if (!r.ok || !r.data.length) { await sendMsg(chatId, "❌ No campaigns found."); return; }
+    const rows = r.data.slice(0, 8).map(c => [{ text: c.name, callback_data: `tz_camp_${c._id}` }]);
+    rows.push([{ text: "◀️ Back", callback_data: "menu_timezone" }]);
+    await editMsg(chatId, msgId, "📅 Select campaign to schedule:", { reply_markup: { inline_keyboard: rows } });
+  }
+  else if (data.startsWith("tz_camp_")) {
+    const campId = data.replace("tz_camp_", "");
+    session.data.tzCampId = campId;
+    session.step = "tz_time";
+    await editMsg(chatId, msgId, "⏰ Enter schedule time in your timezone:\nFormat: `HH:MM` (24hr)\nExample: `09:00` for 9 AM or `20:30` for 8:30 PM", { reply_markup: backKb(lang, "timezone") });
+  }
+  else if (data.startsWith("tz_days_")) {
+    const days = data.replace("tz_days_", "");
+    const daysMap = { weekdays: [1,2,3,4,5], weekends: [0,6], everyday: [0,1,2,3,4,5,6] };
+    const selectedDays = daysMap[days] || [0,1,2,3,4,5,6];
+    const tz = session.data.timezone || "UTC";
+    const tzOffset = TZ_OFFSETS[tz] || 0;
+    const utcHour = ((parseInt(session.data.tzHour || 9) - tzOffset) + 24) % 24;
+    const scheduleTime = `${String(utcHour).padStart(2,"0")}:${session.data.tzMinute || "00"}`;
+    const r = await api("PUT", `/api/campaigns/${session.data.tzCampId}`, {
+      scheduleTime, scheduleDays: selectedDays
+    }, session.token);
+    await bot.answerCallbackQuery(query.id, { text: r.ok ? `✅ Scheduled at ${session.data.tzTime} ${tz}!` : `❌ ${r.error}`, show_alert: true });
+    await showTimezoneScheduler(chatId, msgId, session);
+  }
+
+  // ── MEDIA CAMPAIGN
+  else if (data === "media_photo") { session.data.mediaType = "photo"; session.step = "media_url"; await editMsg(chatId, msgId, "🖼️ Send the photo URL or direct link:", { reply_markup: backKb(lang, "media") }); }
+  else if (data === "media_video") { session.data.mediaType = "video"; session.step = "media_url"; await editMsg(chatId, msgId, "🎥 Send the video URL or direct link:", { reply_markup: backKb(lang, "media") }); }
+  else if (data === "media_camp_create") {
+    session.step = "media_camp_name";
+    await editMsg(chatId, msgId, "📢 Enter campaign name for this media campaign:", { reply_markup: backKb(lang, "media") });
+  }
+
+  // ── POLL CAMPAIGN
+  else if (data === "poll_create") {
+    session.step = "poll_question";
+    session.data.pollOptions = [];
+    await editMsg(chatId, msgId, "📊 *Create Poll Campaign*\n\nEnter your poll question:", { reply_markup: backKb(lang, "media") });
+  }
+  else if (data === "poll_add_option") {
+    session.step = "poll_option";
+    await editMsg(chatId, msgId, `➕ Enter option ${(session.data.pollOptions?.length || 0) + 1}:`, { reply_markup: backKb(lang, "media") });
+  }
+  else if (data === "poll_done") {
+    if (!session.data.pollOptions?.length || session.data.pollOptions.length < 2) {
+      await bot.answerCallbackQuery(query.id, { text: "❌ Need at least 2 options!", show_alert: true });
+      return;
+    }
+    // Build poll message with buttons format
+    const pollMsg = `📊 *${session.data.pollQuestion}*\n\n${session.data.pollOptions.map((o,i) => `${["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"][i]||`${i+1}.`} ${o}`).join("\n")}`;
+    session.data.campMessage = pollMsg;
+    session.step = "camp_name";
+    await editMsg(chatId, msgId, `✅ Poll ready!\n\nPreview:\n${pollMsg}\n\nNow enter campaign name:`, { reply_markup: backKb(lang, "campaigns") });
+  }
+  else if (data === "alerts_toggle") {
+    session.data.sentimentAlerts = !session.data.sentimentAlerts;
+    await bot.answerCallbackQuery(query.id, { text: session.data.sentimentAlerts ? "✅ Alerts ON!" : "🔕 Alerts OFF", show_alert: true });
+    await showAITools(chatId, msgId, session);
   }
 
   // ── INBOX
@@ -440,7 +634,7 @@ bot.on("callback_query", async (query) => {
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
   const chatId = msg.chat.id;
-  const session = getSession(chatId);
+  const session = await getSession(chatId);
   const lang = session.lang || "en";
   const text = msg.text.trim();
 
@@ -448,8 +642,15 @@ bot.on("message", async (msg) => {
   if (session.step === "login_email") { session.data.email = text; session.step = "login_password"; await sendMsg(chatId, t(lang, "enter_password")); return; }
   if (session.step === "login_password") {
     const r = await api("POST", "/api/login", { email: session.data.email, password: text });
-    if (r.ok) { session.token = r.data.token; session.user = r.data.user; session.step = "idle"; await sendMsg(chatId, t(lang, "login_success", { name: r.data.user.name })); await showMainMenu(chatId, session); }
-    else { session.step = "idle"; await sendMsg(chatId, t(lang, "login_fail"), { reply_markup: authKb(lang) }); }
+    if (r.ok) {
+      session.token = r.data.token; session.user = r.data.user; session.step = "idle";
+      await saveSession(chatId, session);
+      await sendMsg(chatId, t(lang, "login_success", { name: r.data.user.name }));
+      await showMainMenu(chatId, session);
+    } else {
+      session.step = "idle";
+      await sendMsg(chatId, t(lang, "login_fail"), { reply_markup: authKb(lang) });
+    }
     return;
   }
 
@@ -458,8 +659,15 @@ bot.on("message", async (msg) => {
   if (session.step === "reg_email") { session.data.email = text; session.step = "reg_password"; await sendMsg(chatId, t(lang, "enter_password")); return; }
   if (session.step === "reg_password") {
     const r = await api("POST", "/api/register", { name: session.data.name, email: session.data.email, password: text, referralCode: session.data.referralCode || "" });
-    if (r.ok) { session.token = r.data.token; session.user = r.data.user; session.step = "idle"; await sendMsg(chatId, t(lang, "register_success", { name: r.data.user.name })); await showMainMenu(chatId, session); }
-    else { session.step = "idle"; await sendMsg(chatId, t(lang, "register_fail", { error: r.error }), { reply_markup: authKb(lang) }); }
+    if (r.ok) {
+      session.token = r.data.token; session.user = r.data.user; session.step = "idle";
+      await saveSession(chatId, session);
+      await sendMsg(chatId, t(lang, "register_success", { name: r.data.user.name }));
+      await showMainMenu(chatId, session);
+    } else {
+      session.step = "idle";
+      await sendMsg(chatId, t(lang, "register_fail", { error: r.error }), { reply_markup: authKb(lang) });
+    }
     return;
   }
 
@@ -574,6 +782,175 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  if (session.step === "tz_peak_camp") {
+    const niche = text.toLowerCase();
+    const peak = PEAK_HOURS[niche] || PEAK_HOURS["general"];
+    session.step = "idle";
+    await sendMsg(chatId, `📊 *Peak Hours for "${text}":*\n\n⏰ Best times: ${peak.hours}\n🎯 Recommended: *${peak.best}*\n\nWant to schedule your campaign at ${peak.best}?`, { reply_markup: { inline_keyboard: [
+      [{ text: `✅ Schedule at ${peak.best}`, callback_data: "tz_schedule_camp" }],
+      [{ text: "◀️ Back", callback_data: "menu_timezone" }],
+    ]}});
+    return;
+  }
+
+  // ── TIMEZONE SCHEDULE TIME
+  if (session.step === "tz_time") {
+    const timeMatch = text.match(/^(\d{1,2}):(\d{2})$/);
+    if (!timeMatch) { await sendMsg(chatId, "❌ Invalid format. Use HH:MM (e.g. 09:00)"); return; }
+    session.data.tzHour = timeMatch[1];
+    session.data.tzMinute = timeMatch[2];
+    session.data.tzTime = text;
+    session.step = "idle";
+    await sendMsg(chatId, `✅ Time set to ${text} ${session.data.timezone || "UTC"}\n\nWhich days to post?`, { reply_markup: { inline_keyboard: [
+      [{ text: "📅 Every Day", callback_data: "tz_days_everyday" }],
+      [{ text: "💼 Weekdays Only", callback_data: "tz_days_weekdays" }, { text: "🏖️ Weekends Only", callback_data: "tz_days_weekends" }],
+    ]}});
+    return;
+  }
+
+  // ── MEDIA URL
+  if (session.step === "media_url") {
+    session.data.mediaUrl = text;
+    session.step = "media_caption";
+    await sendMsg(chatId, "📝 Enter caption for the media (or type 'skip' to use no caption):");
+    return;
+  }
+
+  if (session.step === "media_caption") {
+    session.data.mediaCaption = text === "skip" ? "" : text;
+    session.step = "idle";
+    await sendMsg(chatId, `✅ Media ready!\n\nType: ${session.data.mediaType}\nURL: ${session.data.mediaUrl?.slice(0,50)}...\n\nNow create a campaign to use this media:`, { reply_markup: { inline_keyboard: [
+      [{ text: "🚀 Create Media Campaign", callback_data: "media_camp_create" }],
+      [{ text: "◀️ Back", callback_data: "menu_media" }],
+    ]}});
+    return;
+  }
+
+  if (session.step === "media_camp_name") {
+    session.data.campName = text;
+    session.step = "media_camp_message";
+    await sendMsg(chatId, "📝 Enter the text message to send with media (or type 'skip'):");
+    return;
+  }
+
+  if (session.step === "media_camp_message") {
+    session.data.campMessage = text === "skip" ? session.data.mediaCaption || "Check this out!" : text;
+    session.step = "idle";
+    await sendMsg(chatId, "⏳ Creating media campaign...");
+    const accR = await api("GET", "/api/accounts", null, session.token);
+    const grpR = await api("GET", "/api/groups", null, session.token);
+    if (!accR.ok || !accR.data.length || !grpR.ok || !grpR.data.length) {
+      await sendMsg(chatId, "❌ Need at least 1 account and 1 group first!");
+      return;
+    }
+    const r = await api("POST", "/api/campaigns", {
+      name: session.data.campName,
+      message: session.data.campMessage,
+      mediaUrl: session.data.mediaUrl,
+      mediaType: session.data.mediaType,
+      mediaCaption: session.data.mediaCaption || session.data.campMessage,
+      groupIds: grpR.data.slice(0, 100).map(g => g._id),
+      accountIds: accR.data.filter(a => a.status === "active").map(a => a._id),
+      postsPerDay: 10, delayMin: 12, delayMax: 45, intervalMinutes: 15, batchSize: 5,
+      useSmartRotation: true, skipBlacklisted: true,
+    }, session.token);
+    await sendMsg(chatId, r.ok ? `✅ Media campaign *${session.data.campName}* created!\n\nGo to Campaigns to start it.` : `❌ ${r.error}`);
+    await showMediaCampaign(chatId, null, session);
+    return;
+  }
+
+  // ── POLL
+  if (session.step === "poll_question") {
+    session.data.pollQuestion = text;
+    session.data.pollOptions = [];
+    session.step = "poll_option";
+    await sendMsg(chatId, `✅ Question set!\n\nNow enter option 1:`);
+    return;
+  }
+
+  if (session.step === "poll_option") {
+    if (!session.data.pollOptions) session.data.pollOptions = [];
+    session.data.pollOptions.push(text);
+    const count = session.data.pollOptions.length;
+    const kb = { inline_keyboard: [
+      [{ text: `➕ Add Option ${count + 1}`, callback_data: "poll_add_option" }],
+      count >= 2 ? [{ text: "✅ Done — Create Poll Campaign", callback_data: "poll_done" }] : [],
+    ].filter(r => r.length > 0)};
+    await sendMsg(chatId, `✅ Option ${count} added: "${text}"\n\nCurrent options:\n${session.data.pollOptions.map((o,i) => `${i+1}. ${o}`).join("\n")}`, { reply_markup: kb });
+    session.step = "idle";
+    return;
+  }
+
+  // ── AI CAMPAIGN CREATOR
+  if (session.step === "ai_camp_product") {
+    session.data.aiProduct = text;
+    session.step = "ai_camp_audience";
+    await sendMsg(chatId, "👥 Who is your target audience?\n\nExample: `crypto traders`, `gym lovers`, `small business owners`");
+    return;
+  }
+  if (session.step === "ai_camp_audience") {
+    session.data.aiAudience = text;
+    session.step = "ai_camp_goal";
+    await sendMsg(chatId, "🎯 What is your goal?\n\nExample: `get signups`, `sell product`, `grow channel`, `get clients`");
+    return;
+  }
+  if (session.step === "ai_camp_goal") {
+    session.data.aiGoal = text;
+    session.data.aiCampTone = "marketing";
+    session.step = "idle";
+    await sendMsg(chatId, "🎨 Choose message tone:", { reply_markup: { inline_keyboard: [
+      [{ text: "💼 Professional", callback_data: "ai_camp_tone_professional" }, { text: "🔥 Urgent/FOMO", callback_data: "ai_camp_tone_urgent" }],
+      [{ text: "😊 Friendly", callback_data: "ai_camp_tone_casual" }, { text: "😂 Funny", callback_data: "ai_camp_tone_funny" }],
+    ]}});
+    return;
+  }
+
+  // ── GROUP FINDER
+  if (session.step === "groupfinder_keyword") {
+    const keyword = text.trim();
+    session.data.gfKeyword = keyword;
+    session.data.gfNiche = keyword;
+    session.step = "idle";
+    await sendMsg(chatId, `🔍 Searching for groups about *${keyword}*...`);
+    // Need an account to search
+    const accR = await api("GET", "/api/accounts", null, session.token);
+    if (!accR.ok || !accR.data.length) {
+      await sendMsg(chatId, "❌ No accounts found. Add an account first to search groups!");
+      return;
+    }
+    const account = accR.data.find(a => a.status === "active");
+    if (!account) { await sendMsg(chatId, "❌ No active accounts. Activate an account first!"); return; }
+    const r = await api("POST", "/api/groups/search", { keyword, accountId: account._id, limit: 15 }, session.token);
+    if (!r.ok || !r.data.success || !r.data.groups?.length) {
+      await sendMsg(chatId, `❌ No groups found for "${keyword}". Try a different keyword.`);
+      return;
+    }
+    session.data.gfResults = r.data.groups;
+    const details = r.data.groups.slice(0, 10).map(g => `• @${g.username} — ${(g.members||0).toLocaleString()} members`).join("\n");
+    const rows = r.data.groups.slice(0, 8).map(g => [{ text: `➕ @${g.username} (${(g.members||0).toLocaleString()})`, callback_data: `gf_add_${g.username}` }]);
+    rows.push([{ text: `✅ Add All ${r.data.groups.length} Groups`, callback_data: "gf_add_all" }]);
+    rows.push([{ text: "◀️ Back", callback_data: "menu_groupfinder" }]);
+    await sendMsg(chatId, `🔍 *Found ${r.data.groups.length} groups for "${keyword}":*\n\n${details}`, { reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+
+  // ── AI REPLY TEMPLATES
+  if (session.step === "ai_reply_tpl") {
+    session.step = "idle";
+    await sendMsg(chatId, "🤖 Generating reply templates...");
+    const groqR = await callGroq(`Generate 5 short professional reply templates for a Telegram marketer responding to: "${text}". Each reply should be under 50 words, conversational, and end with a soft call to action. Return ONLY a JSON array of strings.`);
+    if (groqR) {
+      let response = "💬 *AI Reply Templates:*\n\n";
+      groqR.forEach((v, i) => { response += `*${i+1}.* ${v}\n\n`; });
+      response += "_Copy and use these in your inbox replies!_";
+      await sendMsg(chatId, response);
+    } else {
+      await sendMsg(chatId, "❌ AI failed. Try again.");
+    }
+    await showAITools(chatId, null, session);
+    return;
+  }
+
   // ── AI REWRITE
   if (session.step === "ai_rewrite") {
     await sendMsg(chatId, "🤖 Generating AI variants...");
@@ -584,7 +961,7 @@ bot.on("message", async (msg) => {
       r.data.variants.forEach((v, i) => { response += `*${i+1}.* ${v}\n\n`; });
       await sendMsg(chatId, response);
     } else { await sendMsg(chatId, `❌ AI rewrite failed: ${r.error}`); }
-    await showMainMenu(chatId, session);
+    await showAITools(chatId, null, session);
     return;
   }
 
@@ -646,7 +1023,7 @@ bot.on("callback_query", async (query) => {
 
   const chatId = query.message.chat.id;
   const data = query.data;
-  const session = getSession(chatId);
+  const session = await getSession(chatId);
   const lang = session.lang || "en";
 
   await bot.answerCallbackQuery(query.id).catch(() => {});
@@ -976,13 +1353,146 @@ bot.on("successful_payment", async (msg) => {
   await showMainMenu(chatId, session);
 });
 
+// ── AI GROQ HELPER ────────────────────────────────────────────────────────────
+async function callGroq(prompt, systemPrompt = "You are a helpful marketing assistant. Return ONLY valid JSON, no markdown, no explanation.") {
+  try {
+    const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+    const r = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
+      max_tokens: 1500, temperature: 0.9,
+    }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` }, timeout: 15000 });
+    const text = r.data.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
+    return JSON.parse(text);
+  } catch (e) {
+    console.error("Groq error:", e.message);
+    return null;
+  }
+}
+
+async function generateAICampaign(chatId, session) {
+  await sendMsg(chatId, "🤖 Generating AI campaign messages...");
+  const { aiProduct, aiAudience, aiGoal, aiCampTone } = session.data;
+  const result = await callGroq(
+    `Create 5 powerful Telegram group marketing messages for:\nProduct/Service: ${aiProduct}\nTarget audience: ${aiAudience}\nGoal: ${aiGoal}\nTone: ${aiCampTone}\n\nRules:\n- Each message under 200 words\n- Include emoji\n- Natural, not spammy\n- End with clear CTA\n- Use spintax {option1|option2} for variety\n\nReturn ONLY a JSON array of 5 strings.`
+  );
+  if (!result || !result.length) { await sendMsg(chatId, "❌ AI generation failed. Try again."); return; }
+  session.data.aiGeneratedMsg = result[0];
+  session.data.aiGeneratedVariants = result.slice(1);
+  let response = `✨ *AI Generated Campaign Messages:*\n\n`;
+  result.forEach((v, i) => { response += `*${i+1}.* ${v}\n\n`; });
+  await sendMsg(chatId, response, { reply_markup: { inline_keyboard: [
+    [{ text: "🚀 Use for Campaign", callback_data: "ai_camp_use" }],
+    [{ text: "💾 Save as Template", callback_data: "ai_camp_save" }],
+    [{ text: "🔄 Regenerate", callback_data: "ai_camp_regenerate" }],
+    [{ text: "◀️ Back", callback_data: "menu_ai" }],
+  ]}});
+}
+
+// ── SENTIMENT ALERT SYSTEM ────────────────────────────────────────────────────
+const sentimentAlertUsers = new Set(); // track who has alerts on
+
+async function checkSentimentAlerts() {
+  try {
+    for (const [chatId, session] of Object.entries(sessions)) {
+      if (!session.token || !session.data.sentimentAlerts) continue;
+      const r = await api("GET", "/api/inbox?limit=20&isRead=false", null, session.token);
+      if (!r.ok || !r.data.messages?.length) continue;
+      for (const msg of r.data.messages) {
+        if (msg.sentiment === "positive" && !session.data.alertedMsgs?.includes(msg._id)) {
+          if (!session.data.alertedMsgs) session.data.alertedMsgs = [];
+          session.data.alertedMsgs.push(msg._id);
+          await sendMsg(chatId, `🔔 *Positive Reply Alert!*\n\n@${msg.fromUsername||"Someone"} replied positively:\n\n_"${(msg.message||"").slice(0,100)}"_\n\nReply now from Inbox! 🎯`, {
+            reply_markup: { inline_keyboard: [[{ text: "📬 Open Inbox", callback_data: "menu_inbox" }]] }
+          });
+          // Mark as read
+          await api("PUT", `/api/inbox/${msg._id}/read`, {}, session.token);
+        }
+      }
+    }
+  } catch (e) { console.error("Sentiment alert error:", e.message); }
+}
+
+// Run sentiment alerts every 2 minutes
+setInterval(checkSentimentAlerts, 2 * 60 * 1000);
+
+// ── AI TOOLS DISPLAY ──────────────────────────────────────────────────────────
+async function showAITools(chatId, msgId, session) {
+  const lang = session.lang || "en";
+  const alertsOn = session.data.sentimentAlerts || false;
+  const text = `🤖 *AI Tools*\n\nPowerful AI features to supercharge your campaigns:\n\n🎯 *Campaign Creator* — Describe your product, AI writes the perfect message\n✨ *Message Rewriter* — Get 5 variants of any message\n💬 *Reply Templates* — AI suggests replies for your inbox\n🔔 *Sentiment Alerts* — Get notified when someone replies positively\n\nAlerts: ${alertsOn ? "🟢 ON" : "🔴 OFF"}`;
+  const kb = { inline_keyboard: [
+    [{ text: "🎯 AI Campaign Creator", callback_data: "ai_campaign_creator" }],
+    [{ text: "✨ AI Message Rewriter", callback_data: "ai_rewrite" }],
+    [{ text: "💬 AI Reply Templates", callback_data: "ai_reply_templates" }],
+    [{ text: `${alertsOn ? "🔕 Disable" : "🔔 Enable"} Sentiment Alerts`, callback_data: "alerts_toggle" }],
+    [{ text: "◀️ Back", callback_data: "back_main" }],
+  ]};
+  if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
+  else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
+async function showGroupFinder(chatId, msgId, session) {
+  const lang = session.lang || "en";
+  const text = `🔍 *AI Group Finder*\n\nFind relevant Telegram groups by keyword or niche automatically.\n\n_Uses your connected account to search Telegram._`;
+  const kb = { inline_keyboard: [
+    [{ text: "🔍 Search Groups by Keyword", callback_data: "groupfinder_search" }],
+    [{ text: "◀️ Back", callback_data: "back_main" }],
+  ]};
+  if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
+  else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
+// ── TIMEZONE DATA ─────────────────────────────────────────────────────────────
+const TZ_OFFSETS = {
+  "UTC": 0, "EST": -5, "PST": -8, "CST": -6, "MST": -7,
+  "GMT": 0, "BST": 1, "CET": 1, "EET": 2, "MSK": 3,
+  "GST": 4, "PKT": 5, "IST": 5.5, "BST+6": 6, "ICT": 7,
+  "SGT": 8, "JST": 9, "AEST": 10, "NZST": 12,
+  "BRT": -3, "ART": -3, "CAT": 2, "EAT": 3, "WAT": 1,
+};
+
+const PEAK_HOURS = {
+  "crypto":    { hours: "08:00-10:00, 14:00-16:00, 20:00-22:00", best: "20:00" },
+  "business":  { hours: "09:00-11:00, 13:00-15:00", best: "10:00" },
+  "ecommerce": { hours: "10:00-12:00, 18:00-21:00", best: "19:00" },
+  "general":   { hours: "08:00-10:00, 12:00-14:00, 19:00-21:00", best: "19:00" },
+  "news":      { hours: "07:00-09:00, 12:00-13:00, 17:00-19:00", best: "08:00" },
+};
+
+async function showTimezoneScheduler(chatId, msgId, session) {
+  const lang = session.lang || "en";
+  const currentTz = session.data.timezone || "UTC";
+  const text = `🌍 *Timezone Scheduler*\n\nCurrent timezone: *${currentTz}*\n\nSchedule your campaigns to post at the perfect time in YOUR timezone — no manual UTC conversion needed!\n\n📊 *Peak Hours by Niche:*\n🔐 Crypto: 8-10am, 2-4pm, 8-10pm\n💼 Business: 9-11am, 1-3pm\n🛒 E-commerce: 10am-12pm, 6-9pm\n📰 News/General: 7-9am, 7-9pm`;
+  const kb = { inline_keyboard: [
+    [{ text: `🌍 Set Timezone (now: ${currentTz})`, callback_data: "tz_pick" }],
+    [{ text: "📅 Schedule a Campaign", callback_data: "tz_schedule_camp" }],
+    [{ text: "📊 Peak Hour Auto-Post", callback_data: "tz_peak_detect" }],
+    [{ text: "◀️ Back", callback_data: "back_main" }],
+  ]};
+  if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
+  else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
+async function showMediaCampaign(chatId, msgId, session) {
+  const lang = session.lang || "en";
+  const text = `🖼️ *Media Campaigns*\n\nSend images, videos or create poll campaigns to boost engagement!\n\n📸 *Photo Campaign* — Image + caption\n🎥 *Video Campaign* — Video + caption\n📊 *Poll Campaign* — Interactive poll message`;
+  const kb = { inline_keyboard: [
+    [{ text: "📸 Photo Campaign", callback_data: "media_photo" }, { text: "🎥 Video Campaign", callback_data: "media_video" }],
+    [{ text: "📊 Poll/Button Campaign", callback_data: "poll_create" }],
+    [{ text: "◀️ Back", callback_data: "back_main" }],
+  ]};
+  if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
+  else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
 // ── COMMANDS ──────────────────────────────────────────────────────────────────
-bot.onText(/\/stats/, async (msg) => { const s = getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showStats(msg.chat.id, null, s); });
-bot.onText(/\/campaigns/, async (msg) => { const s = getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showCampaigns(msg.chat.id, null, s); });
-bot.onText(/\/groups/, async (msg) => { const s = getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showGroups(msg.chat.id, null, s); });
-bot.onText(/\/accounts/, async (msg) => { const s = getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showAccounts(msg.chat.id, null, s); });
-bot.onText(/\/billing/, async (msg) => { const s = getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showBilling(msg.chat.id, null, s); });
-bot.onText(/\/help/, async (msg) => { await showHelp(msg.chat.id, null, getSession(msg.chat.id)); });
+bot.onText(/\/stats/, async (msg) => { const s = await getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showStats(msg.chat.id, null, s); });
+bot.onText(/\/campaigns/, async (msg) => { const s = await getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showCampaigns(msg.chat.id, null, s); });
+bot.onText(/\/groups/, async (msg) => { const s = await getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showGroups(msg.chat.id, null, s); });
+bot.onText(/\/accounts/, async (msg) => { const s = await getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showAccounts(msg.chat.id, null, s); });
+bot.onText(/\/billing/, async (msg) => { const s = await getSession(msg.chat.id); if (!s.token) return sendMsg(msg.chat.id, "Login first with /start"); await showBilling(msg.chat.id, null, s); });
+bot.onText(/\/help/, async (msg) => { await showHelp(msg.chat.id, null, await getSession(msg.chat.id)); });
 
 // ── ERRORS ────────────────────────────────────────────────────────────────────
 bot.on("polling_error", (e) => console.error("Polling error:", e.message));
