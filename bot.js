@@ -547,6 +547,22 @@ bot.on("callback_query", async (query) => {
     await editMsg(chatId, msgId, "📤 Enter the @username or group username to forward replies to:", { reply_markup: backKeyboard(lang, "main") });
   }
 
+  // ── SETTINGS
+  else if (data === "settings_lang") {
+    await editMsg(chatId, msgId, "🌐 Choose your language:", { reply_markup: langKeyboard() });
+  }
+  else if (data === "settings_referral") {
+    const code = session.user?.referralCode || "";
+    const botInfo = await bot.getMe();
+    const link = `https://t.me/${botInfo.username}?start=${code}`;
+    await sendMsg(chatId, `🔗 *Your Referral Link:*\n\n${link}\n\n💰 Earn 20% commission on every referral payment!`);
+  }
+
+  // ── CHECK PAYMENT
+  else if (data.startsWith("checkpay_")) {
+    await handleCheckPay(query);
+  }
+
   // ── ADMIN
   else if (data === "admin_stats") await showAdminStats(chatId, msgId, session);
   else if (data === "admin_users") await showAdminUsers(chatId, msgId, session);
@@ -1065,7 +1081,7 @@ bot.on("successful_payment", async (msg) => {
 });
 
 // ── CHECK PAYMENT STATUS ──────────────────────────────────────────────────────
-bot.on("callback_query", async (query) => {
+async function handleCheckPay(query) {
   if (!query.data.startsWith("checkpay_")) return;
   const chatId = query.message.chat.id;
   const session = getSession(chatId);
@@ -1085,24 +1101,7 @@ bot.on("callback_query", async (query) => {
     const ur = await api("GET", "/api/me", null, session.token);
     if (ur.ok) session.user = ur.data;
   }
-});
-
-// ── SETTINGS CALLBACKS ────────────────────────────────────────────────────────
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-  const msgId = query.message.message_id;
-  const data = query.data;
-  const session = getSession(chatId);
-
-  if (data === "settings_lang") {
-    await editMsg(chatId, msgId, "🌐 Choose your language:", { reply_markup: langKeyboard() });
-  } else if (data === "settings_referral") {
-    const code = session.user?.referralCode || "";
-    const link = `https://t.me/${(await bot.getMe()).username}?start=${code}`;
-    await bot.answerCallbackQuery(query.id).catch(() => {});
-    await sendMsg(chatId, `🔗 *Your Referral Link:*\n\n${link}\n\n💰 Earn 20% commission on every referral payment!`);
-  }
-});
+}
 
 // ── /stats command ────────────────────────────────────────────────────────────
 bot.onText(/\/stats/, async (msg) => {
