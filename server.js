@@ -212,6 +212,50 @@ const AccountInboxSettings = mongoose.model("AccountInboxSettings", new mongoose
   createdAt: { type: Date, default: Date.now },
 }));
 
+// ── BOT SESSION STORE ─────────────────────────────────────────────────────────
+const BotSession = mongoose.model("BotSession", new mongoose.Schema({
+  telegramId: { type: String, required: true, unique: true },
+  token: { type: String, default: "" },
+  userId: { type: String, default: "" },
+  userName: { type: String, default: "" },
+  userPlan: { type: String, default: "trial" },
+  userCredits: { type: Number, default: 0 },
+  userIsAdmin: { type: Boolean, default: false },
+  userEmail: { type: String, default: "" },
+  userReferralCode: { type: String, default: "" },
+  lang: { type: String, default: "en" },
+  forwardTarget: { type: String, default: "" },
+  sentimentAlerts: { type: Boolean, default: false },
+  timezone: { type: String, default: "UTC" },
+  updatedAt: { type: Date, default: Date.now },
+}));
+
+// ── BOT SESSION API ───────────────────────────────────────────────────────────
+app.get("/api/bot-session/:telegramId", async (req, res) => {
+  try {
+    const s = await BotSession.findOne({ telegramId: req.params.telegramId });
+    res.json(s || {});
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/bot-session/:telegramId", async (req, res) => {
+  try {
+    const s = await BotSession.findOneAndUpdate(
+      { telegramId: req.params.telegramId },
+      { ...req.body, telegramId: req.params.telegramId, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
+    res.json(s);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/bot-session/:telegramId", async (req, res) => {
+  try {
+    await BotSession.findOneAndDelete({ telegramId: req.params.telegramId });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── PLAN CONFIG ───────────────────────────────────────────────────────────────
 const PLAN_LIMITS = {
   trial:   { accounts: 1,   groups: 50,    campaigns: 1,   postsPerDay: 10,   templates: 5   },
@@ -508,6 +552,42 @@ app.delete("/api/groups", auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post("/api/groups/search", auth, async (req, res) => {
+  try {
+    const { keyword, accountId, limit = 15 } = req.body;
+    if (!keyword || !accountId) return res.status(400).json({ error: "keyword and accountId required" });
+    const account = await TgAccount.findOne({ _id: accountId, userId: req.user.id });
+    if (!account?.sessionString) return res.status(400).json({ error: "Account not found" });
+    const safeKeyword = keyword.replace(/"/g,"").replace(/\\/g,"").slice(0, 50);
+    const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.contacts import SearchRequest
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        result = await client(SearchRequest(q="${safeKeyword}", limit=${Math.min(parseInt(limit), 50)}))
+        groups = []
+        for chat in result.chats:
+            try:
+                uname = getattr(chat, "username", "") or ""
+                title = getattr(chat, "title", "") or ""
+                members = getattr(chat, "participants_count", 0) or 0
+                if uname:
+                    groups.append({"username": uname, "title": title, "members": members})
+            except: pass
+        await client.disconnect()
+        print(json.dumps({"success": True, "groups": groups}))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+asyncio.run(main())
+`;
+    res.json(await runPython(script, 30000));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── BLACKLIST ─────────────────────────────────────────────────────────────────
 app.get("/api/blacklist", auth, async (req, res) => {
   try { res.json(await Blacklist.find({ userId: req.user.id }).sort({ createdAt: -1 })); }
@@ -801,6 +881,91 @@ app.put("/api/inbox/settings/:accountId", auth, async (req, res) => {
     );
     res.json(s);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/api/inbox/read-all", auth, async (req, res) => {
+  try { await InboxMessage.updateMany({ userId: req.user.id }, { isRead: true }); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/api/inbox/:id/read", auth, async (req, res) => {
+  try { await InboxMessage.findOneAndUpdate({ _id: req.params.id, userId: req.user.id }, { isRead: true }); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/inbox/:id/reply", auth, async (req, res) => {
+  try {
+    const { replyText } = req.body;
+    if (!replyText) return res.status(400).json({ error: "replyText required" });
+    const msg = await InboxMessage.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!msg) return res.status(404).json({ error: "Not found" });
+    const account = await TgAccount.findOne({ _id: msg.accountId, userId: req.user.id });
+    if (!account?.sessionString) return res.status(400).json({ error: "Account not available" });
+    const escaped = replyText.replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n");
+    const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        entity = await client.get_entity(${msg.fromUserId ? `int("${msg.fromUserId}")` : `"${msg.fromUsername}"`})
+        await client.send_message(entity, "${escaped}")
+        await client.disconnect()
+        print(json.dumps({"success": True}))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+asyncio.run(main())
+`;
+    const result = await runPython(script, 30000);
+    if (!result.success) return res.status(400).json({ error: result.error });
+    await InboxMessage.findByIdAndUpdate(msg._id, { isReplied: true, replyText, isRead: true, replyMode: "manual" });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/inbox/:id/ai-reply", auth, async (req, res) => {
+  try {
+    const { send = false } = req.body;
+    const msg = await InboxMessage.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!msg) return res.status(404).json({ error: "Not found" });
+    const r = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: GROQ_MODEL,
+      messages: [
+        { role: "system", content: "You are a helpful sales assistant. Reply in 1-3 sentences max. Be conversational." },
+        { role: "user", content: msg.message },
+      ],
+      max_tokens: 200, temperature: 0.8,
+    }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
+    const aiReply = r.data.choices[0].message.content.trim();
+    await InboxMessage.findByIdAndUpdate(msg._id, { aiReply, isRead: true });
+    if (send) {
+      const account = await TgAccount.findOne({ _id: msg.accountId, userId: req.user.id });
+      if (account?.sessionString) {
+        const escaped = aiReply.replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n");
+        const script = `
+import asyncio, json
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+async def main():
+    try:
+        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        await client.connect()
+        entity = await client.get_entity(${msg.fromUserId ? `int("${msg.fromUserId}")` : `"${msg.fromUsername}"`})
+        await client.send_message(entity, "${escaped}")
+        await client.disconnect()
+        print(json.dumps({"success": True}))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+asyncio.run(main())
+`;
+        const result = await runPython(script, 30000);
+        if (result.success) await InboxMessage.findByIdAndUpdate(msg._id, { isReplied: true, replyMode: "ai", replyText: aiReply });
+      }
+    }
+    res.json({ success: true, aiReply });
+  } catch (e) { res.status(500).json({ error: "AI reply failed: " + e.message }); }
 });
 
 // ── PAYMENTS ──────────────────────────────────────────────────────────────────
