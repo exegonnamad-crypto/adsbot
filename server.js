@@ -758,9 +758,11 @@ async function runCampaignBatch(campaign) {
         Campaign.findByIdAndUpdate(campaign._id, { $inc: { totalSent: 1 } }),
         CampaignLog.create({ userId: campaign.userId, campaignId: campaign._id, accountId: account._id, groupId: group._id, groupTitle: group.title, accountPhone: account.phone, message, status: "sent" }),
       ]);
+      console.log(`✅ Sent to @${group.username} via ${account.phone}`);
       const user = await User.findById(campaign.userId);
       if (user?.credits > 0) await User.findByIdAndUpdate(campaign.userId, { $inc: { credits: -1 } });
     } else {
+      console.error(`❌ Failed to send to @${group.username}: ${result.error}`);
       await Promise.all([
         Campaign.findByIdAndUpdate(campaign._id, { $inc: { totalFailed: 1 } }),
         CampaignLog.create({ userId: campaign.userId, campaignId: campaign._id, accountId: account._id, groupId: group._id, groupTitle: group.title, accountPhone: account.phone, message, status: "failed", error: result.error }),
