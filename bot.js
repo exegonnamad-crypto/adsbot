@@ -343,6 +343,17 @@ bot.on("callback_query", async (query) => {
     session.step = "camp_name"; session.data = {};
     await editMsg(chatId, msgId, "📢 *Create Campaign*\n\nEnter campaign name:", { reply_markup: backKb(lang, "campaigns") });
   }
+  else if (data.startsWith("camp_sendnow_")) {
+    const id = data.replace("camp_sendnow_", "");
+    await bot.answerCallbackQuery(query.id, { text: "🧪 Sending test message...", show_alert: false });
+    await sendMsg(chatId, "⏳ Sending test message now...");
+    const r = await api("POST", `/api/campaigns/${id}/send-now`, {}, session.token);
+    if (r.ok && r.data.success) {
+      await sendMsg(chatId, `✅ *Test sent successfully!*\n\n${r.data.message}`);
+    } else {
+      await sendMsg(chatId, `❌ *Test failed:*\n\n${r.data?.error || r.error}`);
+    }
+  }
   else if (data.startsWith("camp_start_")) {
     const id = data.replace("camp_start_", "");
     const r = await api("POST", `/api/campaigns/${id}/start`, {}, session.token);
@@ -373,6 +384,7 @@ bot.on("callback_query", async (query) => {
           c.status === "active"
             ? [{ text: "⏸ Pause", callback_data: `camp_pause_${id}` }]
             : [{ text: "▶️ Start", callback_data: `camp_start_${id}` }],
+          [{ text: "🧪 Send Now (Test)", callback_data: `camp_sendnow_${id}` }],
           [{ text: "🗑️ Delete", callback_data: `camp_delete_${id}` }],
           [{ text: t(lang, "back"), callback_data: "menu_campaigns" }],
         ]};
