@@ -683,25 +683,28 @@ bot.on("callback_query", async (query) => {
       const groups = count === "all" ? r.data : r.data.slice(0, parseInt(count));
       session.data.campGroups = groups.map(g => g._id);
     }
-    session.step = "idle";
-    await sendMsg(chatId, "⏳ Creating campaign...");
-    const campR = await api("POST", "/api/campaigns", {
-      name: session.data.campName,
-      message: session.data.campMessage,
-      variants: session.data.campVariants || [],
-      groupIds: session.data.campGroups,
-      accountIds: session.data.campAccounts,
-      postsPerDay: 10, delayMin: 12, delayMax: 45,
-      intervalMinutes: 15, batchSize: 5,
-      useSpintax: session.data.campMessage?.includes("{"),
-      useSmartRotation: true, skipBlacklisted: true,
-    }, session.token);
-    if (campR.ok) {
-      await sendMsg(chatId, `✅ *Campaign Created!*\n\nName: *${campR.data.name}*\nGroups: ${session.data.campGroups?.length}\nAccounts: ${session.data.campAccounts?.length}\n\nGo to Campaigns to start it! 🚀`);
-    } else {
-      await sendMsg(chatId, `❌ Failed: ${campR.error}`);
+    // Ask for delay setting
+    await sendMsg(chatId, `⏱️ *Choose delay between messages:*\n\n_Longer delays = safer, less bans_`, { reply_markup: { inline_keyboard: [
+      [{ text: "15 mins", callback_data: "camp_delay_15" }, { text: "30 mins", callback_data: "camp_delay_30" }],
+      [{ text: "45 mins", callback_data: "camp_delay_45" }, { text: "1 hour", callback_data: "camp_delay_60" }],
+      [{ text: "2 hours", callback_data: "camp_delay_120" }, { text: "✏️ Custom (mins)", callback_data: "camp_delay_custom" }],
+    ]}});
+  }
+
+  // ── CAMPAIGN DELAY SELECTION
+  else if (data.startsWith("camp_delay_")) {
+    const preset = data.replace("camp_delay_", "");
+    if (preset === "custom") {
+      session.step = "camp_delay_custom";
+      await sendMsg(chatId, "✏️ Enter delay in minutes:\nExample: `20` = 20 minutes between each post");
+      return;
     }
-    await showCampaigns(chatId, null, session);
+    const mins = parseInt(preset);
+    const secMin = mins * 60;
+    const secMax = mins * 60 + 60; // add 1 min variance
+    session.data.campDelayMin = secMin;
+    session.data.campDelayMax = secMax;
+    await createCampaignFinal(chatId, session);
   }
 });
 
@@ -865,6 +868,20 @@ bot.on("message", async (msg) => {
       [{ text: `✅ Schedule at ${peak.best}`, callback_data: "tz_schedule_camp" }],
       [{ text: "◀️ Back", callback_data: "menu_timezone" }],
     ]}});
+    return;
+  }
+
+  // ── CUSTOM DELAY
+  if (session.step === "camp_delay_custom") {
+    const mins = parseInt(text.trim());
+    if (isNaN(mins) || mins < 1) {
+      await sendMsg(chatId, "❌ Invalid. Enter a number like `20` for 20 minutes.");
+      return;
+    }
+    session.data.campDelayMin = mins * 60;
+    session.data.campDelayMax = mins * 60 + 60;
+    session.step = "idle";
+    await createCampaignFinal(chatId, session);
     return;
   }
 
@@ -1447,6 +1464,35 @@ async function showAITools(chatId, msgId, session) {
   ]};
   if (msgId) await editMsg(chatId, msgId, text, { reply_markup: kb });
   else await sendMsg(chatId, text, { reply_markup: kb });
+}
+
+async function createCampaignFinal(chatId, session) {
+  session.step = "idle";
+  const dMin = session.data.campDelayMin || 1800;
+  const dMax = session.data.campDelayMax || 1860;
+  const dMins = Math.round(dMin / 60);
+  await sendMsg(chatId, `⏳ Creating campaign...\n\nDelay: ~${dMins} minutes between posts`);
+  const campR = await api("POST", "/api/campaigns", {
+    name: session.data.campName,
+    message: session.data.campMessage,
+    variants: session.data.campVariants || [],
+    groupIds: session.data.campGroups,
+    accountIds: session.data.campAccounts,
+    postsPerDay: 10,
+    delayMin: dMin,
+    delayMax: dMax,
+    intervalMinutes: 15,
+    batchSize: 5,
+    useSpintax: session.data.campMessage?.includes("{"),
+    useSmartRotation: true,
+    skipBlacklisted: true,
+  }, session.token);
+  if (campR.ok) {
+    await sendMsg(chatId, `✅ *Campaign Created!*\n\nName: *${campR.data.name}*\nGroups: ${session.data.campGroups?.length}\nAccounts: ${session.data.campAccounts?.length}\n⏱️ Delay: ~${dMins} mins between posts\n\nGo to Campaigns to start it! 🚀`);
+  } else {
+    await sendMsg(chatId, `❌ Failed: ${campR.error}`);
+  }
+  await showCampaigns(chatId, null, session);
 }
 
 async function showBlacklist(chatId, msgId, session) {
