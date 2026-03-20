@@ -414,12 +414,22 @@ app.post("/api/accounts/send-otp", auth, async (req, res) => {
     const proxyParts = proxy ? proxy.replace("socks5://","").split(":") : null;
     const proxyLine = proxyParts ? `, proxy=("socks5", "${proxyParts[0]}", int("${proxyParts[1] || 1080}"))` : "";
     const script = `
-import asyncio, json
+import asyncio, json, random
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+devices = [
+    ("Samsung Galaxy S23", "Android 13", "9.6.7"),
+    ("iPhone 14 Pro", "iOS 16.5", "9.6.3"),
+    ("Xiaomi 13", "Android 13", "9.5.9"),
+    ("OnePlus 11", "Android 13", "9.6.1"),
+    ("Google Pixel 7", "Android 13", "9.6.5"),
+]
+d = random.choice(devices)
 async def main():
     try:
-        client = TelegramClient(StringSession(), int("${useApiId}"), "${useApiHash}"${proxyLine})
+        client = TelegramClient(StringSession(), int("${useApiId}"), "${useApiHash}"${proxyLine},
+            device_model=d[0], system_version=d[1], app_version=d[2],
+            lang_code="en", system_lang_code="en-US")
         await client.connect()
         result = await client.send_code_request("${phone}")
         session = client.session.save()
@@ -755,9 +765,32 @@ app.post("/api/campaigns/:id/start", auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/campaigns/:id/pause", auth, async (req, res) => {
-  try { await Campaign.findOneAndUpdate({ _id: req.params.id, userId: req.user.id }, { status: "paused" }); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+app.post("/api/campaigns/:id/send-now", auth, async (req, res) => {
+  try {
+    const campaign = await Campaign.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    const groups = await TgGroup.find({ _id: { $in: campaign.groupIds }, isActive: true, isBlacklisted: false });
+    const accounts = await TgAccount.find({ _id: { $in: campaign.accountIds }, status: "active" });
+    if (!accounts.length) return res.status(400).json({ error: "No active accounts" });
+    if (!groups.length) return res.status(400).json({ error: "No active groups" });
+    const account = accounts[0];
+    const group = groups[0];
+    const message = campaign.message;
+    console.log(`🧪 Test send to @${group.username} via ${account.phone}`);
+    const result = await sendToGroup(account, group, message, campaign.mediaUrl, campaign.mediaType, campaign.mediaCaption);
+    if (result.success) {
+      if (result.session) await TgAccount.findByIdAndUpdate(account._id, { sessionString: result.session });
+      await Promise.all([
+        TgAccount.findByIdAndUpdate(account._id, { $inc: { groupsSent: 1, dailySent: 1 }, lastUsedAt: new Date() }),
+        TgGroup.findByIdAndUpdate(group._id, { $inc: { totalPosts: 1 }, lastPostedAt: new Date() }),
+        Campaign.findByIdAndUpdate(campaign._id, { $inc: { totalSent: 1 } }),
+        CampaignLog.create({ userId: campaign.userId, campaignId: campaign._id, accountId: account._id, groupId: group._id, groupTitle: group.title, accountPhone: account.phone, message, status: "sent" }),
+      ]);
+      res.json({ success: true, message: `✅ Sent to @${group.username}` });
+    } else {
+      res.json({ success: false, error: result.error });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── SEND ENGINE ───────────────────────────────────────────────────────────────
@@ -768,15 +801,37 @@ async function sendToGroup(account, group, message, mediaUrl, mediaType, mediaCa
   if (mediaUrl && mediaType && ["photo","video","document"].includes(mediaType)) {
     sendCode = `await client.send_file(entity, "${mediaUrl.replace(/"/g,'\\"')}", caption="${escapedCaption||escaped}")`;
   }
+
+  // Real device fingerprints to avoid detection
+  const devices = [
+    { device: "Samsung Galaxy S23", system: "Android 13", app: "9.6.7" },
+    { device: "iPhone 14 Pro", system: "iOS 16.5", app: "9.6.3" },
+    { device: "Xiaomi 13", system: "Android 13", app: "9.5.9" },
+    { device: "OnePlus 11", system: "Android 13", app: "9.6.1" },
+    { device: "Google Pixel 7", system: "Android 13", app: "9.6.5" },
+    { device: "Samsung Galaxy A54", system: "Android 13", app: "9.5.8" },
+    { device: "iPhone 13", system: "iOS 16.3", app: "9.5.5" },
+  ];
+  const fp = devices[Math.floor(Math.random() * devices.length)];
+
   const script = `
 import asyncio, json, random
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 async def main():
     try:
-        client = TelegramClient(StringSession("${account.sessionString}"), int("${account.apiId}"), "${account.apiHash}")
+        client = TelegramClient(
+            StringSession("${account.sessionString}"),
+            int("${account.apiId}"),
+            "${account.apiHash}",
+            device_model="${fp.device}",
+            system_version="${fp.system}",
+            app_version="${fp.app}",
+            lang_code="en",
+            system_lang_code="en-US"
+        )
         await client.connect()
-        await asyncio.sleep(random.uniform(1, 3))
+        await asyncio.sleep(random.uniform(2, 5))
         entity = await client.get_entity("${group.username}")
         ${sendCode}
         new_session = client.session.save()
